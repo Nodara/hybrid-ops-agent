@@ -1,0 +1,26 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in your .env}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-4-8}
+      MAX_TOKENS: ${MAX_TOKENS:-4096}
+      THINKING: ${THINKING:-on}
+      MAX_ITERATIONS: ${MAX_ITERATIONS:-12}
+      DATABASE_PATH: /app/data/useradmin.db
+      PORT: "3000"
+    volumes:
+      # Persist the SQLite database across container restarts.
+      - useradmin-data:/app/data
+
+volumes:
+  useradmin-data:
+
+# --- Swapping SQLite for Postgres (the brief's production target) ---
+# The data model maps 1:1 to Postgres. To move over you'd:
+#   1. add a `db: image: postgres:16` service + volume here,
+#   2. point the repository layer (DatabaseService) at a pg client,
+#   3. set a DATABASE_URL env var instead of DATABASE_PATH.
+# Left as SQLite for zero-config local dev.

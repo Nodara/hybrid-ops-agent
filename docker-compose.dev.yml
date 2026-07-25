@@ -1,0 +1,20 @@
+# Dev overlay — layer on top of docker-compose.yml for live reload:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# `nest start --watch` recompiles and restarts the Node process INSIDE the
+# running container whenever a file under ./src changes on your host — no
+# container stop/rebuild needed.
+services:
+  app:
+    build:
+      target: dev
+    command: npm run start:dev
+    volumes:
+      # Bind-mount the whole project so edits propagate into the container...
+      - .:/app
+      # ...but keep the container's Linux-built node_modules (better-sqlite3 is
+      # a native module; the host's macOS build would crash here). This
+      # anonymous volume shadows ./node_modules from the bind mount above.
+      - /app/node_modules
+      # Persist the SQLite database across restarts (same as prod).
+      - useradmin-data:/app/data

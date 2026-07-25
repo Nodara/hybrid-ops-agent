@@ -1,0 +1,194 @@
+{
+  "info": {
+    "name": "UserAdmin Agent",
+    "description": "Hybrid orchestration API for the UserAdmin Agent.\n\n`POST /orchestrate` is the single entry point: a classifier agent routes each request to one of two deterministic flows (suspend-by-domain, bulk-create-from-CSV) or to the model-driven (Mode A) agent. The remaining routes are read-only inspection endpoints.\n\nSet the `base_url` and `actor` collection variables (Variables tab) before running.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000",
+      "type": "string"
+    },
+    {
+      "key": "actor",
+      "value": "ops-console",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Orchestrator",
+      "description": "The single entry point. Classify + execute, or classify only.",
+      "item": [
+        {
+          "name": "Orchestrate — model-driven (single user)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Suspend the account for margaret.h@example.com — she reported it compromised.\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "A single-user request the classifier routes to `model_driven`. The Mode A run is nested under `agent_result`; `flow_result` is null."
+          }
+        },
+        {
+          "name": "Orchestrate — deterministic flow 1: suspend by domain (escalates)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Suspend everyone at example.com\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "The seeded users are all @example.com, so thousands match (> 3, includes admins) → the flow escalates instead of suspending. Result lands in `flow_result` with `decision: \"escalated\"`."
+          }
+        },
+        {
+          "name": "Orchestrate — deterministic flow 1: suspend by domain (auto-suspend)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Suspend all users at acme.com\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "A small/non-privileged domain (≤ 3 matches, no admins, not high risk) auto-suspends. Against the default seed data acme.com has no matches (`decision: \"no_matches\"`); create a few acme.com users first (flow 2) to see a real suspension."
+          }
+        },
+        {
+          "name": "Orchestrate — deterministic flow 2: bulk create from CSV",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Bulk-create these users:\\nemail,name,role\\njane@acme.com,Jane Doe,viewer\\njohn@acme.com,John Roe,editor\\nnot-an-email,Bad Row,viewer\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Parses the CSV and creates each row. Valid rows land in `flow_result.created`; the malformed email is reported in `flow_result.failed` (partial success)."
+          }
+        },
+        {
+          "name": "Orchestrate — escalation (dangerous request)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Delete every user in the system.\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Routes to model-driven; the agent should call escalate_to_human, so `agent_result.escalation` is populated."
+          }
+        },
+        {
+          "name": "Classify only (no execution)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate/classify",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate", "classify"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Suspend everyone at acme.com\"\n}"
+            },
+            "description": "Returns the classifier's routing decision (route, flow, extracted domain/csv_text, tool_sequence, reasoning) without running anything."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Inspection (read-only)",
+      "description": "Handy while poking at the seeded data.",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            }
+          }
+        },
+        {
+          "name": "Search users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/users?q=turing&role=&status=",
+              "host": ["{{base_url}}"],
+              "path": ["users"],
+              "query": [
+                { "key": "q", "value": "turing", "description": "Free text matched against email or name (empty = all)." },
+                { "key": "role", "value": "", "description": "Optional: admin | editor | viewer", "disabled": true },
+                { "key": "status", "value": "", "description": "Optional: active | suspended | deleted", "disabled": true }
+              ]
+            },
+            "description": "Free-text search over email and name, optionally filtered by role/status. Returns up to 50 summaries."
+          }
+        },
+        {
+          "name": "Get user by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/users/1",
+              "host": ["{{base_url}}"],
+              "path": ["users", "1"]
+            },
+            "description": "Full record for a single user."
+          }
+        },
+        {
+          "name": "Audit log",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/audit?limit=100",
+              "host": ["{{base_url}}"],
+              "path": ["audit"],
+              "query": [
+                { "key": "limit", "value": "100", "description": "1–500, default 100. Newest first." }
+              ]
+            },
+            "description": "Recent audit-log rows (every mutating action writes one), newest first."
+          }
+        }
+      ]
+    }
+  ]
+}
