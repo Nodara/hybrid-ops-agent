@@ -10,7 +10,8 @@ export interface OrchestrationResult {
   classification: ClassificationResult;
   /** The engine actually used — may differ from the classifier if it fell back. */
   route: "deterministic" | "model_driven";
-  flow: ClassificationResult["flow"];
+  /** Reflects whichever flow actually ran — wider than what the classifier can select. */
+  flow: FlowResult["flow"] | null;
   /** Present when a deterministic flow ran. */
   flow_result: FlowResult | null;
   /** Present when the model-driven (Mode A) engine ran. */

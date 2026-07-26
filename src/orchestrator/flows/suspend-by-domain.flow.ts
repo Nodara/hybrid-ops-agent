@@ -1,10 +1,19 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { UsersService } from "../../users/users.service";
+import { UserSummary } from "../../users/user.types";
 import { assessDomainRisk } from "./risk-assessment";
 import { FlowStep, SuspendByDomainResult } from "./flow.types";
 
 /** Escalate instead of suspending when MORE THAN this many users match. */
 const MAX_AUTO_SUSPEND = 3;
+/**
+ * Hard ceiling on how many users this flow will ever suspend in a single
+ * invocation — independent of the risk-escalation gate above (MAX_AUTO_SUSPEND
+ * is meant to be crossed and tuned; this is a backstop that should not move
+ * with it). Two separate guardrails, not one: even if the escalation gate is
+ * ever loosened or misconfigured, this still blocks a runaway blast radius.
+ */
+const MAX_SUSPEND_PER_INVOCATION = 50;
 /** How many matched users to echo back in the result preview. */
 const SAMPLE_SIZE = 20;
 
@@ -18,7 +27,8 @@ const SAMPLE_SIZE = 20;
  *        escalate to a human if ANY of:
  *          - more than MAX_AUTO_SUSPEND users match, OR
  *          - any matched user is an admin, OR
- *          - the risk level is "high"
+ *          - the risk level is "high", OR
+ *          - more than MAX_SUSPEND_PER_INVOCATION users match (hard ceiling)
  *        otherwise suspend each matched user.
  */
 @Injectable()
@@ -26,6 +36,35 @@ export class SuspendByDomainFlow {
   private readonly logger = new Logger(SuspendByDomainFlow.name);
 
   constructor(private readonly users: UsersService) {}
+
+  private escalate(
+    domain: string,
+    matched: UserSummary[],
+    matched_sample: SuspendByDomainResult["matched_sample"],
+    risk: SuspendByDomainResult["risk"],
+    reasons: string[],
+    steps: FlowStep[],
+  ): SuspendByDomainResult {
+    const summary =
+      `Requested suspension of all users at "${domain}" ` +
+      `(${matched.length} matched) requires human approval: ${reasons.join("; ")}.`;
+    this.logger.warn(`ESCALATION [${risk.level}] ${summary}`);
+    steps.push({
+      step: "escalate_or_suspend",
+      detail: { decision: "escalated", reasons },
+    });
+    return {
+      flow: "suspend_users_by_domain",
+      domain,
+      matched_count: matched.length,
+      matched_sample,
+      risk,
+      decision: "escalated",
+      escalation: { summary, risk_level: risk.level, reasons },
+      suspended: null,
+      steps,
+    };
+  }
 
   /** Normalize "@Acme.com", "user@acme.com", "ACME.COM" → "acme.com". */
   private normalizeDomain(raw: string): string {
@@ -89,33 +128,33 @@ export class SuspendByDomainFlow {
     }
 
     if (reasons.length > 0) {
-      const summary =
-        `Requested suspension of all users at "${domain}" ` +
-        `(${matched.length} matched) requires human approval: ${reasons.join("; ")}.`;
-      this.logger.warn(`ESCALATION [${risk.level}] ${summary}`);
-      steps.push({
-        step: "escalate_or_suspend",
-        detail: { decision: "escalated", reasons },
-      });
-      return {
-        flow: "suspend_users_by_domain",
+      return this.escalate(domain, matched, matched_sample, risk, reasons, steps);
+    }
+
+    // Independent hard ceiling, checked separately from the reasons-based
+    // gate above so it still applies even if that gate's logic changes.
+    if (matched.length > MAX_SUSPEND_PER_INVOCATION) {
+      return this.escalate(
         domain,
-        matched_count: matched.length,
+        matched,
         matched_sample,
         risk,
-        decision: "escalated",
-        escalation: { summary, risk_level: risk.level, reasons },
-        suspended: null,
+        [
+          `${matched.length} users match (> ${MAX_SUSPEND_PER_INVOCATION} hard suspend ceiling)`,
+        ],
         steps,
-      };
+      );
     }
 
     // Safe to auto-suspend: small, no admins, not high risk.
     const reason = `Bulk domain suspension of ${domain} (deterministic flow).`;
     const user_ids: number[] = [];
     for (const u of matched) {
-      // Skip accounts already suspended/deleted — suspend() would just re-write.
-      if (u.status === "suspended" || u.status === "deleted") continue;
+      // Deleted accounts are left alone — suspending a deleted account isn't
+      // meaningful. Already-suspended accounts still go through suspend(),
+      // which is idempotent: it no-ops the row update but still logs the
+      // attempt (retries/double-runs of this flow shouldn't go unaudited).
+      if (u.status === "deleted") continue;
       this.users.suspend(actor, u.id, reason);
       user_ids.push(u.id);
     }

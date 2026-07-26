@@ -5,8 +5,10 @@ import { LlmModule } from "../llm/llm.module";
 import { ClassifierService } from "./classifier.service";
 import { OrchestratorService } from "./orchestrator.service";
 import { OrchestratorController } from "./orchestrator.controller";
+import { FlowsController } from "./flows.controller";
 import { SuspendByDomainFlow } from "./flows/suspend-by-domain.flow";
 import { BulkCreateUsersFlow } from "./flows/bulk-create-users.flow";
+import { BulkOnboardUsersFlow } from "./flows/bulk-onboard-users.flow";
 
 /**
  * Hybrid orchestration: a classifier agent routes each request to one of two
@@ -19,7 +21,8 @@ import { BulkCreateUsersFlow } from "./flows/bulk-create-users.flow";
     OrchestratorService,
     SuspendByDomainFlow,
     BulkCreateUsersFlow,
+    BulkOnboardUsersFlow,
   ],
-  controllers: [OrchestratorController],
+  controllers: [OrchestratorController, FlowsController],
 })
 export class OrchestratorModule {}

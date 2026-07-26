@@ -46,9 +46,10 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   cleanUpAllTables(): void {
     const wipe = this.db.transaction(() => {
       this.db.exec("DELETE FROM audit_log;");
+      this.db.exec("DELETE FROM transactions;");
       this.db.exec("DELETE FROM users;");
       this.db.exec(
-        "DELETE FROM sqlite_sequence WHERE name IN ('users','audit_log');",
+        "DELETE FROM sqlite_sequence WHERE name IN ('users','audit_log','transactions');",
       );
     });
     wipe();
@@ -61,8 +62,10 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         email      TEXT NOT NULL UNIQUE,
         name       TEXT NOT NULL,
-        role       TEXT NOT NULL CHECK (role IN ('admin','editor','viewer')),
+        role       TEXT NOT NULL CHECK (role IN ('admin','editor','viewer','customer')),
         status     TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','suspended','deleted')),
+        country    TEXT,
+        city       TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
@@ -74,6 +77,19 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         timestamp      TEXT NOT NULL DEFAULT (datetime('now')),
         details        TEXT,
         FOREIGN KEY (target_user_id) REFERENCES users(id)
+      );
+
+      -- Shared ledger: every financial event on a user, regardless of which
+      -- product wrote it (Product 2's refunds/billing, Product 3 reads from it).
+      CREATE TABLE IF NOT EXISTS transactions (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL,
+        type         TEXT NOT NULL CHECK (type IN ('subscription_charge','refund','balance_credit','balance_debit')),
+        amount_cents INTEGER NOT NULL,
+        currency     TEXT NOT NULL DEFAULT 'usd',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        metadata     TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
       );
     `);
   }
@@ -137,11 +153,32 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     "wayne-enterprises.com",
   ];
 
-  private static readonly ROLES = ["admin", "editor", "viewer"] as const;
-  private static readonly STATUSES = [
-    "active",
-    "suspended",
-    "deleted",
+  private static readonly ROLES = [
+    "admin",
+    "editor",
+    "viewer",
+    "customer",
+  ] as const;
+
+  /** Country -> a plausible city, kept as pairs so city always matches its country. */
+  private static readonly LOCATIONS: [string, string][] = [
+    ["United States", "New York"],
+    ["United States", "San Francisco"],
+    ["United Kingdom", "London"],
+    ["Germany", "Berlin"],
+    ["France", "Paris"],
+    ["Japan", "Tokyo"],
+    ["Australia", "Sydney"],
+    ["Canada", "Toronto"],
+    ["Brazil", "Sao Paulo"],
+    ["India", "Bangalore"],
+  ];
+
+  private static readonly TRANSACTION_TYPES = [
+    "subscription_charge",
+    "refund",
+    "balance_credit",
+    "balance_debit",
   ] as const;
 
   private seedIfEmpty(): void {
@@ -152,11 +189,37 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     };
     if (count > 0) return;
 
-    const insert = this.db.prepare(
-      "INSERT INTO users (email, name, role, status) VALUES (@email, @name, @role, @status)",
+    const insertUser = this.db.prepare(
+      "INSERT INTO users (email, name, role, status, country, city) VALUES (@email, @name, @role, @status, @country, @city)",
     );
+    const insertTransaction = this.db.prepare(
+      "INSERT INTO transactions (user_id, type, amount_cents, currency, metadata) VALUES (?, ?, ?, 'usd', ?)",
+    );
+
     const seed = this.db.transaction((rows: Record<string, string>[]) => {
-      for (const row of rows) insert.run(row);
+      for (const row of rows) {
+        const info = insertUser.run(row);
+        // Give customer accounts a small transaction history so the shared
+        // ledger has data to query (Product 2/3 territory, but Product 1
+        // seeds it since it owns the identity table).
+        if (row.role === "customer") {
+          const userId = Number(info.lastInsertRowid);
+          // Customer ids are always multiples of 4 (role cycles every 4
+          // users), so id % 4 would always be 0 — divide down first to get
+          // a value that actually varies per customer.
+          const txCount = Math.floor(userId / 4) % 4; // 0-3 transactions
+          for (let t = 0; t < txCount; t++) {
+            const type = DatabaseService.TRANSACTION_TYPES[t % 4];
+            const amount = type === "subscription_charge" ? 2900 : 500 * (t + 1);
+            insertTransaction.run(
+              userId,
+              type,
+              amount,
+              JSON.stringify({ plan: "pro" }),
+            );
+          }
+        }
+      }
     });
 
     seed(this.generateUsers(DatabaseService.SEED_COUNT));
@@ -173,7 +236,8 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
    * 25th is deleted so the data has some variety.
    */
   private generateUsers(count: number): Record<string, string>[] {
-    const { FIRST_NAMES, LAST_NAMES, ROLES, DOMAINS } = DatabaseService;
+    const { FIRST_NAMES, LAST_NAMES, ROLES, DOMAINS, LOCATIONS } =
+      DatabaseService;
     const users: Record<string, string>[] = [];
 
     for (let i = 0; i < count; i++) {
@@ -184,12 +248,16 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       const status =
         i % 25 === 0 ? "deleted" : i % 10 === 0 ? "suspended" : "active";
       const domain = DOMAINS[Math.floor(Math.random() * DOMAINS.length)];
+      const [country, city] =
+        LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
 
       users.push({
         email: `${first}.${last}.${i + 1}@${domain}`.toLowerCase(),
         name: `${first} ${last}`,
         role,
         status,
+        country,
+        city,
       });
     }
 

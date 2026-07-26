@@ -24,8 +24,10 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
     name: "search_users",
     description:
       "Search users by a free-text query matched against email and name. " +
-      "Optionally filter by role and/or status. Returns a list of user summaries. " +
-      "Use an empty query string to list users (optionally narrowed by the filters).",
+      "Optionally filter by role, status, country, and/or city. Returns a list of " +
+      "user summaries. Use an empty query string to list users (optionally narrowed " +
+      "by the filters) — e.g. to look up a customer by email, pass the email as the " +
+      "query with role: \"customer\".",
     input_schema: {
       type: "object",
       properties: {
@@ -36,13 +38,21 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
         },
         role: {
           type: "string",
-          enum: ["admin", "editor", "viewer"],
+          enum: ["admin", "editor", "viewer", "customer"],
           description: "Optional role filter.",
         },
         status: {
           type: "string",
           enum: ["active", "suspended", "deleted"],
           description: "Optional status filter.",
+        },
+        country: {
+          type: "string",
+          description: "Optional exact-match country filter.",
+        },
+        city: {
+          type: "string",
+          description: "Optional exact-match city filter.",
         },
       },
       required: ["query"],
@@ -199,6 +209,8 @@ export function executeTool(
             typeof input.query === "string" ? input.query : "",
             isRole(role) ? (role as Role) : undefined,
             isStatus(status) ? (status as Status) : undefined,
+            typeof input.country === "string" ? input.country : undefined,
+            typeof input.city === "string" ? input.city : undefined,
           ),
         );
       }

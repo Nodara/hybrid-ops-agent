@@ -1,4 +1,4 @@
-export const ROLES = ['admin', 'editor', 'viewer'] as const;
+export const ROLES = ['admin', 'editor', 'viewer', 'customer'] as const;
 export type Role = (typeof ROLES)[number];
 
 export const STATUSES = ['active', 'suspended', 'deleted'] as const;
@@ -10,6 +10,8 @@ export interface User {
   name: string;
   role: Role;
   status: Status;
+  country: string | null;
+  city: string | null;
   created_at: string;
 }
 
@@ -20,6 +22,8 @@ export interface UserSummary {
   name: string;
   role: Role;
   status: Status;
+  country: string | null;
+  city: string | null;
 }
 
 export interface AuditLogEntry {

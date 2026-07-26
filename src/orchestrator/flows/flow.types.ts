@@ -38,4 +38,35 @@ export interface BulkCreateResult {
   steps: FlowStep[];
 }
 
-export type FlowResult = SuspendByDomainResult | BulkCreateResult;
+/** Why a bulk-onboard row wasn't created. */
+export type BulkOnboardSkipReason =
+  | "invalid_format"
+  | "invalid_role"
+  | "duplicate_in_batch"
+  | "duplicate_in_db"
+  | "write_failed";
+
+export interface BulkOnboardRowResult {
+  line: number;
+  email: string;
+  status: "created" | "skipped";
+  reason?: BulkOnboardSkipReason;
+  user?: User;
+}
+
+export interface BulkOnboardResult {
+  flow: "bulk_onboard_users";
+  submitted_rows: number;
+  /** "rejected" means the batch size cap was exceeded — nothing was processed. */
+  outcome: "processed" | "rejected";
+  rejection_reason?: string;
+  created_count: number;
+  skipped_count: number;
+  results: BulkOnboardRowResult[];
+  steps: FlowStep[];
+}
+
+export type FlowResult =
+  | SuspendByDomainResult
+  | BulkCreateResult
+  | BulkOnboardResult;

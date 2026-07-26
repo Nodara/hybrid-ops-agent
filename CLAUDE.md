@@ -10,12 +10,14 @@ Claude via `@anthropic-ai/sdk`). Ops staff send natural-language requests to a s
 deterministic, code-defined flow or by a model-driven agent loop.
 
 This repo is "Product 1 — UserAdmin Agent" out of a four-product spec described in
-`PRODUCT_SPECS.md`. **Only Product 1 is implemented here.** `PRODUCT_SPECS.md` describes a
-target/aspirational spec — some requirements it lists (per-transaction audit writes,
-idempotent suspend, actor-role authorization checks, blast-radius ceilings) are **not yet
-built**; treat that file as a design reference, not a description of current behavior. For
-what's actually implemented vs. missing, trust the README's "Known gaps" section and the
-code itself over `PRODUCT_SPECS.md`.
+`PRODUCT_SPECS.md`. **Only Product 1 is implemented here.** The Product 1 production-realism
+requirements — per-transaction audit writes, idempotent suspend, actor-role authorization
+checks, and a blast-radius ceiling independent of risk escalation — **are built** (see "Shared
+services" and "Deterministic flows" below). `PRODUCT_SPECS.md` otherwise still describes a
+target/aspirational spec for Products 2–4 (SupportDesk, RevenueInvestigator, etc.), none of
+which exist in this codebase; treat that file as a design reference for those, not a
+description of current behavior. For what's actually implemented vs. missing, trust the
+README's "Known gaps" section and the code itself over `PRODUCT_SPECS.md`.
 
 ## Commands
 
@@ -62,8 +64,14 @@ ClassifierService ── one Claude call, tool_choice forced to `route_request`
             └── AgentService — hand-rolled tool loop, 6 tools, tool_choice: auto
 ```
 
+`POST /flows/suspend-domain` and `POST /flows/bulk-onboard` (`orchestrator/flows.controller.ts`)
+call `SuspendByDomainFlow` and the newer `BulkOnboardUsersFlow` directly, bypassing the
+classifier entirely — for callers that already know which flow they want. `bulk_onboard_users`
+is reachable **only** through this direct endpoint today; the classifier still routes
+natural-language CSV requests to `bulk_create_users_from_csv`, not to `bulk_onboard_users`.
+
 Everything shares one `UsersService`, and every mutation writes an `audit_log` row regardless
-of which path produced it.
+of which path produced it, in the same DB transaction as the mutation (see "Shared services").
 
 **Safety rule (`orchestrator/orchestrator.service.ts`):** if the classifier picks a
 deterministic flow but the required parameter (`domain` / `csv_text`) is missing or blank,
@@ -86,16 +94,30 @@ requests) goes to the model-driven engine.
   assessment). Risk scoring is a **pure function** in `flows/risk-assessment.ts` (+40 per
   admin in scope, +10 per editor, blast radius `min(matches,25)×2`, `+min(active,20)` for
   active accounts; ≥70 high, ≥35 medium). Escalates to a human instead of auto-suspending if
-  more than 3 users match, any matched user is an admin, or risk is high — otherwise suspends
-  every matched non-suspended/non-deleted account. `matched_sample` caps at 20; `matched_count`
-  is the true total. With the seeded data (~350 accounts/domain) this flow **always
-  escalates** — exercising the auto-suspend path requires a fresh domain with ≤3 matches, no
-  admins, low/medium risk.
+  more than 3 users match (`MAX_AUTO_SUSPEND`), any matched user is an admin, risk is high, or
+  more than 50 users match (`MAX_SUSPEND_PER_INVOCATION`, checked independently of the other
+  three so it still applies even if `MAX_AUTO_SUSPEND` is ever raised) — otherwise suspends
+  every matched non-deleted account (already-suspended accounts are still passed through
+  `suspend()`, which idempotently no-ops the row update but still audits the attempt).
+  `matched_sample` caps at 20; `matched_count` is the true total. With the seeded data (~350
+  accounts/domain) this flow **always escalates** — exercising the auto-suspend path requires
+  a fresh domain with ≤3 matches, no admins, low/medium risk.
 - **`bulk_create_users_from_csv`** — `parse_csv → create_users`. Optional header row detected
   by an `email` column (any order); without one, columns are assumed `email,name,role`.
   Handles simple double-quote wrapping but not embedded commas. Each row is created
   independently — a bad row lands in `failed` with its line number and error and does not
-  abort the rest (partial success, no rollback).
+  abort the rest (partial success, no rollback). Reachable via `POST /orchestrate` (classifier
+  or model-driven agent); not exposed as its own `/flows/*` route today.
+- **`bulk_onboard_users`** (`flows/bulk-onboard-users.flow.ts`) — takes a `rows:
+  {email,name,role}[]` array directly (no CSV parsing), unlike the flow above. Two-phase:
+  `validate_rows` checks every row (format, role, duplicate-in-batch, duplicate-in-DB) before
+  any writes happen; `create_valid_rows` then creates every row that passed validation inside
+  **one atomic transaction** (`UsersService.runAtomically`) — they all commit together, or (if
+  something unexpected fails mid-write) none do. Rejects the whole batch outright above 500
+  rows rather than truncating it. Returns a per-row result array with
+  `status: "created" | "skipped"` and, for skips, a `reason` (`invalid_format` /
+  `invalid_role` / `duplicate_in_batch` / `duplicate_in_db` / `write_failed`). Reachable only
+  via `POST /flows/bulk-onboard` — the classifier does not route to it.
 
 ### Model-driven engine — Mode A (`src/agent/agent.service.ts`)
 
@@ -109,7 +131,9 @@ parallel tool calls execute together and return as `tool_result` blocks in a sin
 it alongside other tools, those other tools do not run and the loop breaks immediately with no
 `tool_result` returned.
 
-Six tools (`src/agent/tools.ts`): `search_users` (free-text, `LIMIT 50`), `get_user`,
+Six tools (`src/agent/tools.ts`): `search_users` (free-text, optional `role`
+[admin/editor/viewer/customer]/`status`/`country`/`city` filters, `LIMIT 50` — e.g. a
+customer lookup by email is `search_users({ query: email, role: "customer" })`), `get_user`,
 `create_user` (email format validated in code via `isValidEmail` in `user.types.ts`, not
 described to the model; email lowercased; uniqueness enforced), `update_user` (partial,
 rejects empty field set), `suspend_user` (`reason` required in the tool's `input_schema`
@@ -127,31 +151,55 @@ result so it can self-correct rather than crashing the loop.
   today, but a config change has to be made in two places. Known duplication, not yet fixed.
 - `UsersService` is the single source of truth for user mutations; every deterministic flow
   and every agent tool goes through it, and every mutation writes an `audit_log` row.
+  - **Transactional audit writes:** `create`/`update`/`suspend` each wrap their row mutation
+    and audit insert in one SQLite transaction (`UsersService.inTransaction`) — if the audit
+    write throws, the mutation rolls back with it. `runAtomically` exposes the same mechanism
+    publicly so a flow (e.g. `bulk_onboard_users`) can compose several `create` calls into one
+    atomic batch.
+  - **Idempotent `suspend`:** re-suspending an already-suspended user skips the row UPDATE but
+    still writes an audit row (`details.idempotent_noop: true`) — retries/double-clicks are
+    logged, not errored or double-applied.
+  - **Actor-role ACL (`UsersService.authorize`):** every mutating method resolves `actor` to a
+    role — a `users.email` match uses that user's actual role; anything else (e.g. the
+    `"ops-console"` system label used when no operator identity is passed) is treated as a
+    trusted internal caller and resolves to `admin`. Permission matrix: `viewer` → no
+    mutations; `editor` → `create_user`/`update_user` only; `admin` → everything, including
+    `suspend_user`. Enforced in `UsersService` itself (not the tool prompt or schema), so it
+    applies uniformly to agent tool calls and deterministic flows.
 
 ## Data model
 
 ```
-users(id, email, name, role[admin|editor|viewer], status[active|suspended|deleted], created_at)
+users(id, email, name, role[admin|editor|viewer|customer], status[active|suspended|deleted],
+      country, city, created_at)
 audit_log(id, actor, action, target_user_id, timestamp, details)
+transactions(id, user_id, type[subscription_charge|refund|balance_credit|balance_debit],
+             amount_cents, currency, created_at, metadata)
 ```
 
-`audit_log.target_user_id` is a foreign key into `users`; `journal_mode=WAL` and
-`foreign_keys=ON` are set at boot. The SQLite schema is designed to map 1:1 to Postgres.
+`audit_log.target_user_id` and `transactions.user_id` are foreign keys into `users`;
+`journal_mode=WAL` and `foreign_keys=ON` are set at boot. The SQLite schema is designed to map
+1:1 to Postgres. `country`/`city` are nullable and only set by the seed generator today — no
+tool or endpoint lets an operator set them on create/update. `transactions` is seeded but
+nothing in Product 1 reads it yet (it exists for Product 3/RevenueInvestigator per
+`PRODUCT_SPECS.md`, which isn't built in this repo).
 
 ### ⚠️ The database is wiped on every boot
 
-`DatabaseService.onModuleInit()` (`src/database/database.service.ts:32`) runs
+`DatabaseService.onModuleInit()` (`src/database/database.service.ts:21`) runs
 `createSchema() → cleanUpAllTables() → seedIfEmpty()`. `cleanUpAllTables()` deletes every row
-from both tables and resets autoincrement counters, so the reseed **always** runs — IDs are
-not stable across restarts. The seed generates 2500 users (roles round-robin
-admin/editor/viewer; every 10th account `suspended`, every 25th `deleted`; each user gets a
-**random** domain from `example.com`, `acme.com`, `globex.com`, `initech.io`, `umbrella.co`,
-`hooli.com`, `wayne-enterprises.com`), so per-domain counts vary (~350 each) across boots.
-`npm run seed` runs the identical wipe-and-reseed path standalone.
+from all three tables and resets autoincrement counters, so the reseed **always** runs — IDs
+are not stable across restarts. The seed generates 2500 users (roles round-robin
+admin/editor/viewer/customer; every 10th account `suspended`, every 25th `deleted`; each user
+gets a **random** domain from `example.com`, `acme.com`, `globex.com`, `initech.io`,
+`umbrella.co`, `hooli.com`, `wayne-enterprises.com`, and a **random** country/city pair from a
+fixed list), so per-domain counts vary (~350 each) across boots. Every seeded `customer`
+account gets 0–3 sample `transactions` rows. `npm run seed` runs the identical
+wipe-and-reseed path standalone.
 
 ## HTTP API
 
-`POST /orchestrate` is the single entry point (`{ prompt, actor? }`, `actor` defaults to
+`POST /orchestrate` is the main entry point (`{ prompt, actor? }`, `actor` defaults to
 `"ops-console"`; empty/whitespace prompt returns HTTP 200 with `{ "error": "…" }`). Response
 always includes `classification` (raw classifier output) plus `route`/`flow` reflecting what
 actually ran, and exactly one of `flow_result` / `agent_result` populated.
@@ -159,8 +207,14 @@ actually ran, and exactly one of `flow_result` / `agent_result` populated.
 `POST /orchestrate/classify` runs only the classifier and executes nothing — useful for
 checking how a prompt routes before it acts.
 
+`POST /flows/suspend-domain` (`{ domain, actor? }`) and `POST /flows/bulk-onboard`
+(`{ rows: {email,name,role}[], actor? }`) call `SuspendByDomainFlow`/`BulkOnboardUsersFlow`
+directly, bypassing the classifier (`orchestrator/flows.controller.ts`). Both require a
+non-empty `domain`/`rows` or return `{ "error": "…" }` with HTTP 200, same convention as
+`/orchestrate`.
+
 Read-only inspection routes (no API key required, since the Anthropic client is lazy):
-`GET /health`, `GET /users?q=&role=&status=` (`LIMIT 50`), `GET /users/:id`,
+`GET /health`, `GET /users?q=&role=&status=&country=&city=` (`LIMIT 50`), `GET /users/:id`,
 `GET /audit?limit=` (newest first, clamped 1–500).
 
 ## Configuration (env vars)
@@ -197,7 +251,14 @@ thinking; it relies on a forced tool call (`tool_choice: route_request`) for str
   turn.
 - **`status: "deleted"`** is reachable only through `update_user`; there's no dedicated delete
   tool or endpoint.
-- Several guardrails described in `PRODUCT_SPECS.md` Product 1 (transactional audit writes,
-  idempotent suspend, actor-role ACL enforcement, a hard suspend-count ceiling independent of
-  risk escalation) are spec targets, not current behavior — don't assume they exist without
-  checking the code.
+- **`bulk_onboard_users` isn't reachable from natural language.** The classifier's
+  `route_request` tool schema (`classifier.types.ts`) only knows about
+  `suspend_users_by_domain` and `bulk_create_users_from_csv`; `bulk_onboard_users` is only
+  callable via `POST /flows/bulk-onboard`. Extending the classifier to route to it would mean
+  updating `ClassificationResult`/`DeterministicFlow`, the classifier's tool schema, and
+  `OrchestratorService`'s dispatch — not done here.
+- **The actor-role ACL has no real identity/auth behind it.** Any caller can pass any `actor`
+  string (including someone else's email) — `UsersService.authorize` trusts whatever the HTTP
+  caller sends. There's no session/login layer establishing who's actually calling.
+- **`country`/`city` are seed-only.** No tool or endpoint lets an operator set them via
+  `create_user`/`update_user`; they're only ever populated by the seed generator.

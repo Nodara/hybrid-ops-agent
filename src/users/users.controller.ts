@@ -12,10 +12,12 @@ export class UsersController {
     @Query('q') q?: string,
     @Query('role') role?: string,
     @Query('status') status?: string,
+    @Query('country') country?: string,
+    @Query('city') city?: string,
   ) {
     const roleFilter: Role | undefined = isRole(role) ? role : undefined;
     const statusFilter: Status | undefined = isStatus(status) ? status : undefined;
-    return this.users.search(q ?? '', roleFilter, statusFilter);
+    return this.users.search(q ?? '', roleFilter, statusFilter, country, city);
   }
 
   @Get(':id')

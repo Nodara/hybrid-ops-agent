@@ -26,8 +26,12 @@ ClassifierService ── one Claude call, tool_choice forced to `route_request`
             └── AgentService — hand-rolled tool loop, 6 tools, tool_choice: auto
 ```
 
+Two flows also have direct entry points that skip the classifier entirely —
+`POST /flows/suspend-domain` and `POST /flows/bulk-onboard` — for callers that already know
+which workflow they want (see [HTTP API](#http-api)).
+
 Everything shares one `UsersService`, and every mutation writes an `audit_log` row
-regardless of which path produced it.
+regardless of which path produced it, in the same DB transaction as the mutation.
 
 ### Why a classifier
 
@@ -62,8 +66,12 @@ Steps: `find_users_by_domain → assess_risk → escalate_or_suspend`.
 
    Level: `≥ 70` → high, `≥ 35` → medium, else low.
 3. **Escalate or suspend.** Escalates to a human if **any** of: more than **3** users
-   match, **any** matched user is an admin, or risk level is **high**. Otherwise it
-   suspends every matched account, skipping ones already `suspended`/`deleted`.
+   match (`MAX_AUTO_SUSPEND`), **any** matched user is an admin, risk level is **high**, or
+   more than **50** users match (`MAX_SUSPEND_PER_INVOCATION` — a hard ceiling checked
+   independently of the other three, so it still applies even if `MAX_AUTO_SUSPEND` is ever
+   raised). Otherwise it suspends every matched non-deleted account. Already-suspended
+   accounts still go through `suspend()` — it's idempotent, so the row update no-ops but the
+   attempt is still audited.
 
 `decision` is one of `escalated`, `suspended`, or `no_matches`. `matched_sample` is
 capped at 20 users; `matched_count` is the true total.
@@ -80,7 +88,27 @@ Accepts an optional header row in any column order (detected by looking for an `
 column); with no header, columns are assumed to be `email,name,role`. Handles simple
 double-quote wrapping but **not** embedded commas. Each row is created independently —
 a bad row lands in `failed` with its line number and error, and does not abort the rest
-(partial success).
+(partial success). Reachable via `POST /orchestrate` or the model-driven agent; not exposed
+as its own `/flows/*` route.
+
+### `bulk_onboard_users`
+
+Steps: `validate_rows → create_valid_rows`. Reachable only via `POST /flows/bulk-onboard` —
+the classifier doesn't route to it.
+
+Takes a `rows: {email,name,role}[]` array directly (no CSV parsing). Two-phase:
+
+1. **Validate everything first.** Every row is checked — email format, valid role,
+   duplicate against *other rows in the same batch*, and duplicate against the DB — before
+   any writes happen. A batch over **500** rows is rejected outright (`outcome: "rejected"`)
+   rather than silently truncated.
+2. **Write the valid rows atomically.** Every row that passed validation is created inside
+   **one transaction**: they all commit together, or (if something unexpected fails
+   mid-write) none do and the whole batch rolls back.
+
+The response is a per-row array: `{ line, email, status: "created" | "skipped", reason?,
+user? }`, where `reason` is one of `invalid_format`, `invalid_role`, `duplicate_in_batch`,
+`duplicate_in_db`, or `write_failed`.
 
 ## Mode A — model-driven
 
@@ -104,49 +132,78 @@ executed and returned as `tool_result` blocks in a single user turn.
 
 | Tool | Notes |
 |---|---|
-| `search_users(query, role?, status?)` | Free-text against email and name. Empty query matches all. **`LIMIT 50`.** |
+| `search_users(query, role?, status?, country?, city?)` | Free-text against email and name; optional exact-match `role`/`status`/`country`/`city` filters. `role` includes `customer` (e.g. a customer lookup by email is `search_users({ query: email, role: "customer" })`). Empty query matches all. **`LIMIT 50`.** |
 | `get_user(user_id)` | Full record. Errors if not found. |
-| `create_user(email, name, role)` | Email format validated **in code** (`user.types.ts` → `isValidEmail`), not described in the prompt. Email is lowercased; uniqueness enforced. |
+| `create_user(email, name, role)` | Email format validated **in code** (`user.types.ts` → `isValidEmail`), not described in the prompt. Email is lowercased; uniqueness enforced. `role` ∈ admin/editor/viewer. |
 | `update_user(user_id, fields)` | Partial update over `email`/`name`/`role`/`status`. Rejects an empty field set. |
-| `suspend_user(user_id, reason)` | `reason` is **required in the `input_schema`**, not just in prose. |
+| `suspend_user(user_id, reason)` | `reason` is **required in the `input_schema`**, not just in prose. Idempotent — re-suspending an already-suspended user no-ops the row but still audits the attempt. |
 | `escalate_to_human(summary, risk_level)` | **Terminates the loop.** `risk_level` ∈ low/medium/high/critical. |
 
 Invalid input (bad email, missing user, duplicate address, bad role) is returned to the
 model as an `is_error` tool result so it can correct itself rather than crashing the loop.
+So is an authorization failure — `create_user`, `update_user`, and `suspend_user` all check
+the calling `actor`'s role first (see "Actor-role ACL" below) and return an `is_error` result
+if it's not permitted, rather than mutating anything.
+
+### Actor-role ACL
+
+`UsersService` resolves every mutating call's `actor` string to a role before doing anything
+else: a match against a known `users.email` uses that user's real role; anything else
+(including the default `"ops-console"` label) is treated as a trusted internal caller and
+resolves to `admin`. Permission matrix:
+
+| Role | `create_user` | `update_user` | `suspend_user` |
+|---|:---:|:---:|:---:|
+| `viewer` | ✗ | ✗ | ✗ |
+| `editor` | ✓ | ✓ | ✗ |
+| `admin` | ✓ | ✓ | ✓ |
+
+Enforced inside `UsersService` itself, not the tool prompt/schema — so it applies uniformly
+whether the call came from the agent loop or a deterministic flow. There's no real
+session/login layer behind this: any caller can pass any `actor` string, including someone
+else's email.
 
 ## Data model
 
 ```
-users(id, email, name, role[admin|editor|viewer], status[active|suspended|deleted], created_at)
+users(id, email, name, role[admin|editor|viewer|customer],
+      status[active|suspended|deleted], country, city, created_at)
 audit_log(id, actor, action, target_user_id, timestamp, details)
+transactions(id, user_id, type[subscription_charge|refund|balance_credit|balance_debit],
+             amount_cents, currency, created_at, metadata)
 ```
 
-`audit_log.target_user_id` is a foreign key into `users`; `journal_mode=WAL` and
-`foreign_keys=ON` are set at boot.
+`audit_log.target_user_id` and `transactions.user_id` are foreign keys into `users`;
+`journal_mode=WAL` and `foreign_keys=ON` are set at boot. `country`/`city` are nullable and
+only ever populated by the seed generator — no tool or endpoint sets them today.
+`transactions` is seeded but nothing in this codebase reads it yet; it exists to match the
+shared-ledger shape `PRODUCT_SPECS.md` describes for a future Product 3.
 
 ### ⚠️ The database is wiped on every boot
 
 `DatabaseService.onModuleInit()` runs `createSchema() → cleanUpAllTables() → seedIfEmpty()`
-(`database/database.service.ts:32`). `cleanUpAllTables()` deletes every row from
-`audit_log` and `users` and resets the autoincrement counters, so **the reseed always
-runs** and IDs are not stable across restarts.
+(`database/database.service.ts:21`). `cleanUpAllTables()` deletes every row from all three
+tables and resets the autoincrement counters, so **the reseed always runs** and IDs are not
+stable across restarts.
 
 The seed generates **2500** users: names cycle through fixed first/last name pools, roles
-round-robin across admin/editor/viewer, every 10th account is `suspended` and every 25th
-is `deleted`, and each user is assigned a **random** domain from:
+round-robin across admin/editor/viewer/customer, every 10th account is `suspended` and every
+25th is `deleted`, each user is assigned a **random** domain from:
 
 ```
 example.com  acme.com  globex.com  initech.io
 umbrella.co  hooli.com  wayne-enterprises.com
 ```
 
-Because the domain is random per user, per-domain counts vary on every boot (~350 each).
+and a **random** `(country, city)` pair from a fixed list. Because the domain is random per
+user, per-domain counts vary on every boot (~350 each). Every seeded `customer` account also
+gets 0–3 sample `transactions` rows.
 
 `npm run seed` runs the same path standalone — it wipes and reseeds too.
 
 ## HTTP API
 
-`POST /orchestrate` is the single entry point.
+`POST /orchestrate` is the main entry point.
 
 ```jsonc
 // Request
@@ -217,18 +274,36 @@ Per-turn logs also go to stdout:
 [AgentTurn] turn=1 stop_reason=tool_use tools=[search_users({"query":"margaret.h@example.com"})] tokens{in=1234,out=88,cache_read=0,cache_write=0}
 ```
 
+### Direct flow endpoints
+
+Bypass the classifier when you already know which flow you want. Same "empty input → HTTP
+200 with `{ "error": "…" }`" convention as `/orchestrate`; no API key required (these never
+call Claude).
+
+```bash
+# suspend_users_by_domain, direct
+curl -s http://localhost:3000/flows/suspend-domain -H 'content-type: application/json' \
+  -d '{"domain":"acme.com","actor":"nodo"}' | jq
+
+# bulk_onboard_users — rows array, not CSV text; all-or-nothing validation, 500-row cap
+curl -s http://localhost:3000/flows/bulk-onboard -H 'content-type: application/json' \
+  -d '{"rows":[{"email":"jane@acme.com","name":"Jane Doe","role":"viewer"},
+               {"email":"not-an-email","name":"Bad Row","role":"viewer"}],
+       "actor":"nodo"}' | jq
+```
+
 ### Inspection endpoints
 
 ```bash
 curl http://localhost:3000/health              # { "status": "ok", "mode": "A (model-driven)" }
-curl 'http://localhost:3000/users?q=turing'    # also &role= and &status=; LIMIT 50
+curl 'http://localhost:3000/users?q=turing'    # also &role=, &status=, &country=, &city=; LIMIT 50
 curl http://localhost:3000/users/1
 curl 'http://localhost:3000/audit?limit=100'   # newest first; limit clamped to 1–500
 ```
 
 These are read-only and boot without an API key — the Anthropic client is constructed
-lazily, so `/health`, `/users`, and `/audit` work with `ANTHROPIC_API_KEY` unset. Calling
-`/orchestrate` without it returns **503**.
+lazily, so `/health`, `/users`, `/audit`, and the direct flow endpoints all work with
+`ANTHROPIC_API_KEY` unset. Calling `/orchestrate` without it returns **503**.
 
 ## Running
 
@@ -304,6 +379,15 @@ These are real and worth knowing before you extend the project:
   every turn of the loop.
 - **`status: "deleted"`** is reachable only through `update_user`; there is no delete tool
   or endpoint.
+- **`bulk_onboard_users` isn't reachable from natural language.** The classifier only knows
+  about `suspend_users_by_domain` and `bulk_create_users_from_csv`; the rows-array flow is
+  only callable via `POST /flows/bulk-onboard`.
+- **The actor-role ACL has no real identity/auth behind it.** Any caller can pass any `actor`
+  string, including someone else's email — there's no session/login layer establishing who's
+  actually calling. It demonstrates programmatic enforcement of a permission matrix, not a
+  real auth system.
+- **`country`/`city` are seed-only.** No tool or endpoint lets an operator set them via
+  `create_user`/`update_user`.
 
 ## Things to try
 
@@ -313,3 +397,8 @@ These are real and worth knowing before you extend the project:
 - `"Delete every user in the system."` → should reach `escalate_to_human`
 - `"Suspend everyone at acme.com"` → deterministic flow 1, escalates on seeded data
 - `"Suspend everyone"` → no extractable domain, so it falls back to model-driven
+- `curl .../flows/bulk-onboard` with a duplicate email in `rows` twice → one row `created`,
+  the other `skipped` with `reason: "duplicate_in_batch"`
+- Pass `actor` set to a seeded viewer's email to `/orchestrate` and ask it to suspend
+  someone → the ACL rejects it before the DB is touched, and the model relays the
+  `is_error` tool result back to the operator
