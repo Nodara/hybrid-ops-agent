@@ -20,6 +20,8 @@ export interface TurnLog {
   thinking?: string;
   text?: string;
   tool_calls: ToolCallLog[];
+  /** Present when a context-compaction pass ran immediately after this turn. */
+  compaction?: { summarized_pairs: number };
 }
 
 /**
@@ -39,11 +41,15 @@ export class TurnLogger {
         : '<none>';
 
     const u = turn.usage;
+    const compaction = turn.compaction
+      ? ` compacted(${turn.compaction.summarized_pairs} pairs)`
+      : '';
     this.logger.log(
       `turn=${turn.turn} stop_reason=${turn.stop_reason} ` +
         `tools=[${tools}] ` +
         `tokens{in=${u.input_tokens},out=${u.output_tokens},` +
-        `cache_read=${u.cache_read_input_tokens},cache_write=${u.cache_creation_input_tokens}}`,
+        `cache_read=${u.cache_read_input_tokens},cache_write=${u.cache_creation_input_tokens}}` +
+        compaction,
     );
   }
 }

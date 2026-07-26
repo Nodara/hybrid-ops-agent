@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { DatabaseModule } from './database/database.module';
 import { UsersModule } from './users/users.module';
 import { AuditModule } from './audit/audit.module';
+import { SupportDeskModule } from './support-desk/support-desk.module';
 import { AgentModule } from './agent/agent.module';
 import { OrchestratorModule } from './orchestrator/orchestrator.module';
 import { HealthController } from './health.controller';
@@ -11,6 +12,7 @@ import { HealthController } from './health.controller';
     DatabaseModule,
     UsersModule,
     AuditModule,
+    SupportDeskModule,
     AgentModule,
     OrchestratorModule,
   ],

@@ -11,6 +11,11 @@ services:
       MAX_ITERATIONS: ${MAX_ITERATIONS:-12}
       DATABASE_PATH: /app/data/useradmin.db
       PORT: "3000"
+      REFUND_POLICY_ENFORCEMENT: ${REFUND_POLICY_ENFORCEMENT:-code_enforced}
+      COMPACTION_ENABLED: ${COMPACTION_ENABLED:-off}
+      COMPACTION_TURN_THRESHOLD: ${COMPACTION_TURN_THRESHOLD:-20}
+      COMPACTION_TOKEN_THRESHOLD: ${COMPACTION_TOKEN_THRESHOLD:-60000}
+      COMPACTION_KEEP_RECENT_TURNS: ${COMPACTION_KEEP_RECENT_TURNS:-4}
     volumes:
       # Persist the SQLite database across container restarts.
       - useradmin-data:/app/data

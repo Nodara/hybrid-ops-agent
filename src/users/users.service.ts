@@ -69,8 +69,11 @@ export class UsersService {
    * restricted. An actor that doesn't resolve to any user (e.g. the
    * "ops-console" system label used when no operator identity is passed) is
    * treated as a trusted internal caller and gets admin.
+   *
+   * Public so other domains (e.g. SupportDesk's RefundsService) can reuse the
+   * same actor-role lookup instead of duplicating the SQL query.
    */
-  private resolveActorRole(actor: string): Role {
+  resolveActorRole(actor: string): Role {
     const normalized = (actor ?? "").trim().toLowerCase();
     const row = this.db
       .prepare("SELECT role FROM users WHERE email = ?")

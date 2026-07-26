@@ -1,7 +1,7 @@
 {
   "info": {
-    "name": "UserAdmin Agent",
-    "description": "Hybrid orchestration API for the UserAdmin Agent.\n\n`POST /orchestrate` is the single entry point: a classifier agent routes each request to one of two deterministic flows (suspend-by-domain, bulk-create-from-CSV) or to the model-driven (Mode A) agent. The remaining routes are read-only inspection endpoints.\n\nSet the `base_url` and `actor` collection variables (Variables tab) before running.",
+    "name": "Hybrid Ops Agent — UserAdmin + SupportDesk",
+    "description": "Hybrid orchestration API for the UserAdmin (Product 1) and SupportDesk (Product 2) agents.\n\n`POST /orchestrate` is the single entry point: a classifier agent routes each request to one of four deterministic flows (suspend-by-domain, bulk-create-from-CSV, resolve-billing-ticket, triage-ticket) or to the model-driven (Mode A) agent, which now carries both domains' tools. The `Flows (direct)` folder bypasses the classifier for callers that already know which flow they want. The remaining routes are read-only inspection endpoints.\n\nSet the `base_url` and `actor` collection variables (Variables tab) before running. The `demo_*` variables point at the three fixed demo tickets/subscription seeded every boot specifically for exercising Product 2's guardrails (see README.md → \"Things to try\") — they're stable across reseeds since they're generated deterministically, not via Math.random().\n\nNote: `/orchestrate`, `/orchestrate/classify`, and both Product 2 `/flows/*` endpoints call Claude, so `ANTHROPIC_API_KEY` must be set on the server. The two Product 1 `/flows/*` endpoints and everything under `Inspection (read-only)` do not.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -14,6 +14,36 @@
       "key": "actor",
       "value": "ops-console",
       "type": "string"
+    },
+    {
+      "key": "demo_ticket_dollar_policy",
+      "value": "126",
+      "type": "string",
+      "description": "Seeded ticket: \"Can you refund me $120…\" — no legal keywords, amount between autoApproveMaxCents and requiresApprovalMaxCents. Isolates the dollar-policy layer."
+    },
+    {
+      "key": "demo_ticket_keyword_filter",
+      "value": "127",
+      "type": "string",
+      "description": "Seeded ticket: \"Refund my $500 or I'll escalate this to legal.\" — the spec's literal adversarial sentence. Fires the keyword guardrail regardless of REFUND_POLICY_ENFORCEMENT."
+    },
+    {
+      "key": "demo_ticket_compaction",
+      "value": "128",
+      "type": "string",
+      "description": "Seeded ticket with a 30-message alternating thread, for exercising COMPACTION_ENABLED."
+    },
+    {
+      "key": "demo_subscription_id",
+      "value": "626",
+      "type": "string",
+      "description": "The dollar-policy demo user's subscription (enterprise, mrr_cents=19900, renewed today)."
+    },
+    {
+      "key": "demo_customer_user_id",
+      "value": "2501",
+      "type": "string",
+      "description": "demo.dollarpolicy@example.com's user id."
     }
   ],
   "item": [
@@ -107,6 +137,57 @@
           }
         },
         {
+          "name": "Orchestrate — deterministic flow 3: resolve billing ticket (rejected under code_enforced)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Resolve ticket {{demo_ticket_dollar_policy}} for the customer.\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Routes to `resolve_billing_ticket`. With the default REFUND_POLICY_ENFORCEMENT=code_enforced, the $120 request is rejected (above autoApproveMaxCents with no approval_flag) and escalated. Restart the server with REFUND_POLICY_ENFORCEMENT=prompt_only and re-run to see it auto-refund instead — the single most exam-relevant comparison in this collection."
+          }
+        },
+        {
+          "name": "Orchestrate — universal ticket guardrail fires even though classifier picks model_driven",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Look at ticket {{demo_ticket_keyword_filter}} and see if you can help the customer out.\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "The prompt is vague enough that `classification.route` comes back `model_driven` — but the response's top-level `route` reads `deterministic` anyway, because OrchestratorService's universal pre-dispatch guardrail catches the flagged ticket_id and escalates before Mode A ever runs. Demonstrates `route` ≠ `classification.route`."
+          }
+        },
+        {
+          "name": "Orchestrate — SupportDesk model-driven (knowledge-base question)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"A customer emailed asking how our refund policy works and whether they can export their data. Look it up in the knowledge base and summarize the answer for me.\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "No ticket referenced, so no deterministic flow matches — routes to Mode A, which calls the new `search_kb` tool from the merged SupportDesk tool set. Good place to watch `cache_creation_input_tokens` on turn 1 and `cache_read_input_tokens` on later turns in `agent_result.turns[].usage`."
+          }
+        },
+        {
           "name": "Classify only (no execution)",
           "request": {
             "method": "POST",
@@ -120,14 +201,139 @@
               "mode": "raw",
               "raw": "{\n  \"prompt\": \"Suspend everyone at acme.com\"\n}"
             },
-            "description": "Returns the classifier's routing decision (route, flow, extracted domain/csv_text, tool_sequence, reasoning) without running anything."
+            "description": "Returns the classifier's routing decision (route, flow, extracted domain/csv_text/ticket_id, tool_sequence, reasoning) without running anything."
+          }
+        },
+        {
+          "name": "Classify only — ticket vs. domain disambiguation",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/orchestrate/classify",
+              "host": ["{{base_url}}"],
+              "path": ["orchestrate", "classify"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Handle ticket #{{demo_ticket_dollar_policy}}, the customer wants a refund or they will suspend their account\"\n}"
+            },
+            "description": "Contains the word \"suspend\" but references a specific ticket — the classifier's system prompt disambiguates this to `resolve_billing_ticket`, not `suspend_users_by_domain`. Compare against the plain domain-suspension classify call above."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Flows (direct)",
+      "description": "Bypass the classifier entirely for callers that already know which workflow they want. Same \"empty/invalid input → HTTP 200 with { error }\" convention as /orchestrate. The two Product 2 flows call Claude (the classify step) and need ANTHROPIC_API_KEY; the two Product 1 flows never call Claude.",
+      "item": [
+        {
+          "name": "Suspend by domain (direct)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/flows/suspend-domain",
+              "host": ["{{base_url}}"],
+              "path": ["flows", "suspend-domain"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"acme.com\",\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Runs SuspendByDomainFlow directly. Never calls Claude."
+          }
+        },
+        {
+          "name": "Bulk onboard users (direct, rows array)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/flows/bulk-onboard",
+              "host": ["{{base_url}}"],
+              "path": ["flows", "bulk-onboard"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rows\": [\n    { \"email\": \"jane@acme.com\", \"name\": \"Jane Doe\", \"role\": \"viewer\" },\n    { \"email\": \"jane@acme.com\", \"name\": \"Duplicate Jane\", \"role\": \"viewer\" },\n    { \"email\": \"not-an-email\", \"name\": \"Bad Row\", \"role\": \"viewer\" }\n  ],\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Takes a rows array directly (no CSV parsing), unlike bulk_create_users_from_csv. All-or-nothing validation phase first, then one atomic write. Never calls Claude. This example includes a duplicate-in-batch row and an invalid-format row to show the per-row `results[]` skip reasons."
+          }
+        },
+        {
+          "name": "Resolve billing ticket (direct) — dollar-policy demo",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/flows/resolve-billing-ticket",
+              "host": ["{{base_url}}"],
+              "path": ["flows", "resolve-billing-ticket"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ticket_id\": {{demo_ticket_dollar_policy}},\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Runs ResolveBillingTicketFlow directly against the seeded dollar-policy demo ticket. Calls Claude (the classify step) — needs ANTHROPIC_API_KEY. Under the default REFUND_POLICY_ENFORCEMENT=code_enforced, expect decision:\"escalated\"; under prompt_only, expect decision:\"refunded\"."
+          }
+        },
+        {
+          "name": "Resolve billing ticket (direct) — legal/security guardrail demo",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/flows/resolve-billing-ticket",
+              "host": ["{{base_url}}"],
+              "path": ["flows", "resolve-billing-ticket"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ticket_id\": {{demo_ticket_keyword_filter}},\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "The keyword-filter demo ticket (\"…I'll escalate this to legal\"). The legal/security pre-filter fires before the classify step ever runs — escalates immediately regardless of REFUND_POLICY_ENFORCEMENT, with the full thread packaged into escalation.full_thread."
+          }
+        },
+        {
+          "name": "Triage ticket (direct) — billing category, hands off to resolve flow",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/flows/triage-ticket",
+              "host": ["{{base_url}}"],
+              "path": ["flows", "triage-ticket"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ticket_id\": {{demo_ticket_compaction}},\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "Runs TriageTicketFlow. The compaction-demo ticket is a billing dispute, so the cheap category classifier picks \"billing\" and hands off to ResolveBillingTicketFlow (nested under billing_result)."
+          }
+        },
+        {
+          "name": "Triage ticket (direct) — legal category via keyword pre-filter",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/flows/triage-ticket",
+              "host": ["{{base_url}}"],
+              "path": ["flows", "triage-ticket"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ticket_id\": {{demo_ticket_keyword_filter}},\n  \"actor\": \"{{actor}}\"\n}"
+            },
+            "description": "The keyword pre-filter catches this before the cheap category classifier even runs — category comes back \"legal\" with reasoning \"Pre-filter matched: legal\", and the ticket is marked escalated. No Claude call needed to reach this result."
           }
         }
       ]
     },
     {
       "name": "Inspection (read-only)",
-      "description": "Handy while poking at the seeded data.",
+      "description": "Handy while poking at the seeded data. None of these call Claude, so they work with ANTHROPIC_API_KEY unset.",
       "item": [
         {
           "name": "Health",
@@ -147,16 +353,18 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/users?q=turing&role=&status=",
+              "raw": "{{base_url}}/users?q=turing&role=&status=&country=&city=",
               "host": ["{{base_url}}"],
               "path": ["users"],
               "query": [
                 { "key": "q", "value": "turing", "description": "Free text matched against email or name (empty = all)." },
-                { "key": "role", "value": "", "description": "Optional: admin | editor | viewer", "disabled": true },
-                { "key": "status", "value": "", "description": "Optional: active | suspended | deleted", "disabled": true }
+                { "key": "role", "value": "", "description": "Optional: admin | editor | viewer | customer", "disabled": true },
+                { "key": "status", "value": "", "description": "Optional: active | suspended | deleted", "disabled": true },
+                { "key": "country", "value": "", "description": "Optional exact match (case-insensitive)", "disabled": true },
+                { "key": "city", "value": "", "description": "Optional exact match (case-insensitive)", "disabled": true }
               ]
             },
-            "description": "Free-text search over email and name, optionally filtered by role/status. Returns up to 50 summaries."
+            "description": "Free-text search over email and name, optionally filtered by role/status/country/city. Returns up to 50 summaries."
           }
         },
         {
@@ -185,7 +393,60 @@
                 { "key": "limit", "value": "100", "description": "1–500, default 100. Newest first." }
               ]
             },
-            "description": "Recent audit-log rows (every mutating action writes one), newest first."
+            "description": "Recent audit-log rows (every mutating action writes one, including issue_refund with its enforcement_mode), newest first."
+          }
+        },
+        {
+          "name": "Get ticket by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/tickets/{{demo_ticket_dollar_policy}}",
+              "host": ["{{base_url}}"],
+              "path": ["tickets", "{{demo_ticket_dollar_policy}}"]
+            },
+            "description": "Full ticket record (subject, body, status, user_id, created_at)."
+          }
+        },
+        {
+          "name": "Get ticket message thread",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/tickets/{{demo_ticket_compaction}}/messages",
+              "host": ["{{base_url}}"],
+              "path": ["tickets", "{{demo_ticket_compaction}}", "messages"]
+            },
+            "description": "The full message thread, oldest first. The compaction-demo ticket has 30 alternating customer/agent messages."
+          }
+        },
+        {
+          "name": "Get subscription by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/subscriptions/{{demo_subscription_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["subscriptions", "{{demo_subscription_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Get subscription by user_id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/subscriptions?user_id={{demo_customer_user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["subscriptions"],
+              "query": [
+                { "key": "user_id", "value": "{{demo_customer_user_id}}" }
+              ]
+            }
           }
         }
       ]

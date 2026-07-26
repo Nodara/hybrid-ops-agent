@@ -147,7 +147,9 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
     description:
       "Escalate to a human operator for anything dangerous, ambiguous, or outside " +
       "your authority (e.g. bulk deletions, privilege escalation to admin, or requests " +
-      "you cannot safely fulfill). Calling this ENDS the session — no further tools run.",
+      "you cannot safely fulfill). Calling this ENDS the session — no further tools run. " +
+      "If this escalation concerns a SupportDesk ticket, set ticket_id and full_thread so " +
+      "the human picking it up has the complete history, not just a one-line note.",
     input_schema: {
       type: "object",
       properties: {
@@ -161,6 +163,16 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
           enum: ["low", "medium", "high", "critical"],
           description: "Assessed risk of the requested operation.",
         },
+        ticket_id: {
+          type: ["integer", "null"],
+          description: "SupportDesk ticket id if this escalation concerns a ticket, else omit.",
+        },
+        full_thread: {
+          type: ["string", "null"],
+          description:
+            "Full ticket message history plus your reasoning summary, packaged as text. " +
+            "Required whenever ticket_id is set.",
+        },
       },
       required: ["summary", "risk_level"],
     },
@@ -172,18 +184,21 @@ export interface ToolExecutionResult {
   isError: boolean;
 }
 
-function ok(payload: unknown): ToolExecutionResult {
+/** Names handled by executeTool — lets the merged Mode A dispatcher route by name. */
+export const USER_ADMIN_TOOL_NAMES = new Set(TOOL_DEFINITIONS.map((t) => t.name));
+
+export function ok(payload: unknown): ToolExecutionResult {
   return { content: JSON.stringify(payload), isError: false };
 }
 
-function fail(message: string): ToolExecutionResult {
+export function fail(message: string): ToolExecutionResult {
   return { content: JSON.stringify({ error: message }), isError: true };
 }
 
-function coerceId(raw: unknown): number {
+export function coerceId(raw: unknown): number {
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
-    throw new UserOperationError(`Invalid user_id: ${JSON.stringify(raw)}.`);
+    throw new UserOperationError(`Invalid id: ${JSON.stringify(raw)}.`);
   }
   return n;
 }

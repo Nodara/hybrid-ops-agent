@@ -1,4 +1,5 @@
 import { User, UserSummary } from "../../users/user.types";
+import { Refund, TicketMessage } from "../../support-desk/support-desk.types";
 
 /** A single executed step in a deterministic flow, captured for observability. */
 export interface FlowStep {
@@ -66,7 +67,37 @@ export interface BulkOnboardResult {
   steps: FlowStep[];
 }
 
+/** A packaged escalation preserving full ticket context, not a one-line note. */
+export interface TicketEscalation {
+  summary: string;
+  risk_level: RiskAssessment["level"];
+  reasons: string[];
+  full_thread: string;
+}
+
+export interface ResolveBillingTicketResult {
+  flow: "resolve_billing_ticket";
+  ticket_id: number;
+  decision: "refunded" | "escalated" | "replied_no_refund";
+  requested_amount_cents: number | null;
+  refund: Refund | null;
+  escalation: TicketEscalation | null;
+  reply: TicketMessage | null;
+  steps: FlowStep[];
+}
+
+export interface TriageTicketResult {
+  flow: "triage_ticket";
+  ticket_id: number;
+  category: "billing" | "technical" | "legal" | "other";
+  reasoning: string;
+  billing_result: ResolveBillingTicketResult | null;
+  steps: FlowStep[];
+}
+
 export type FlowResult =
   | SuspendByDomainResult
   | BulkCreateResult
-  | BulkOnboardResult;
+  | BulkOnboardResult
+  | ResolveBillingTicketResult
+  | TriageTicketResult;

@@ -4,7 +4,10 @@ import { ClassifierService } from "./classifier.service";
 import { ClassificationResult } from "./classifier.types";
 import { SuspendByDomainFlow } from "./flows/suspend-by-domain.flow";
 import { BulkCreateUsersFlow } from "./flows/bulk-create-users.flow";
-import { FlowResult } from "./flows/flow.types";
+import { ResolveBillingTicketFlow } from "./flows/resolve-billing-ticket.flow";
+import { TriageTicketFlow } from "./flows/triage-ticket.flow";
+import { FlowResult, TriageTicketResult } from "./flows/flow.types";
+import { TicketsService } from "../support-desk/tickets.service";
 
 export interface OrchestrationResult {
   classification: ClassificationResult;
@@ -34,11 +37,31 @@ export class OrchestratorService {
     private readonly classifier: ClassifierService,
     private readonly suspendByDomain: SuspendByDomainFlow,
     private readonly bulkCreate: BulkCreateUsersFlow,
+    private readonly resolveBillingTicket: ResolveBillingTicketFlow,
+    private readonly triageTicket: TriageTicketFlow,
+    private readonly tickets: TicketsService,
     private readonly agent: AgentService,
   ) {}
 
   async run(prompt: string, actor: string): Promise<OrchestrationResult> {
     const classification = await this.classifier.classify(prompt);
+
+    // Universal pre-dispatch guardrail: whenever a specific ticket is
+    // referenced, run the legal/security pre-filter immediately — before
+    // EITHER a deterministic flow or Mode A ever sees the ticket, regardless
+    // of route. This closes the gap a flow-level pre-filter alone wouldn't
+    // cover (a ticket-referencing prompt classified as model_driven).
+    if (classification.ticket_id !== null) {
+      const flags = this.tickets.checkLegalOrSecurityFlags(classification.ticket_id);
+      if (flags.flagged) {
+        this.tickets.updateStatus(classification.ticket_id, "escalated");
+        const flow_result = this.legalPrefilterResult(
+          classification.ticket_id,
+          flags.matched_keywords,
+        );
+        return this.result(classification, "deterministic", flow_result, null);
+      }
+    }
 
     if (classification.route === "deterministic") {
       if (
@@ -63,6 +86,28 @@ export class OrchestratorService {
         return this.result(classification, "deterministic", flow_result, null);
       }
 
+      if (
+        classification.flow === "resolve_billing_ticket" &&
+        classification.ticket_id !== null
+      ) {
+        const flow_result = await this.resolveBillingTicket.execute(
+          classification.ticket_id,
+          actor,
+        );
+        return this.result(classification, "deterministic", flow_result, null);
+      }
+
+      if (
+        classification.flow === "triage_ticket" &&
+        classification.ticket_id !== null
+      ) {
+        const flow_result = await this.triageTicket.execute(
+          classification.ticket_id,
+          actor,
+        );
+        return this.result(classification, "deterministic", flow_result, null);
+      }
+
       // Deterministic route chosen but unusable (missing/invalid param) — fall
       // back to the model-driven engine rather than acting on a guess.
       this.logger.warn(
@@ -73,6 +118,22 @@ export class OrchestratorService {
 
     const agent_result = await this.agent.run(prompt, actor);
     return this.result(classification, "model_driven", null, agent_result);
+  }
+
+  private legalPrefilterResult(ticketId: number, matched: string[]): TriageTicketResult {
+    return {
+      flow: "triage_ticket",
+      ticket_id: ticketId,
+      category: "legal",
+      reasoning: `Pre-filter matched: ${matched.join(", ")}`,
+      billing_result: null,
+      steps: [
+        {
+          step: "legal_security_prefilter",
+          detail: { flagged: true, matched_keywords: matched },
+        },
+      ],
+    };
   }
 
   private result(

@@ -4,6 +4,8 @@ import {
   BulkOnboardRow,
   BulkOnboardUsersFlow,
 } from "./flows/bulk-onboard-users.flow";
+import { ResolveBillingTicketFlow } from "./flows/resolve-billing-ticket.flow";
+import { TriageTicketFlow } from "./flows/triage-ticket.flow";
 
 interface SuspendDomainRequest {
   domain: string;
@@ -12,6 +14,11 @@ interface SuspendDomainRequest {
 
 interface BulkOnboardRequest {
   rows: BulkOnboardRow[];
+  actor?: string;
+}
+
+interface TicketFlowRequest {
+  ticket_id: number;
   actor?: string;
 }
 
@@ -27,6 +34,8 @@ export class FlowsController {
   constructor(
     private readonly suspendByDomain: SuspendByDomainFlow,
     private readonly bulkOnboardFlow: BulkOnboardUsersFlow,
+    private readonly resolveBillingTicketFlow: ResolveBillingTicketFlow,
+    private readonly triageTicketFlow: TriageTicketFlow,
   ) {}
 
   @Post("suspend-domain")
@@ -49,5 +58,27 @@ export class FlowsController {
     }
     const actor = (body?.actor ?? "ops-console").trim() || "ops-console";
     return this.bulkOnboardFlow.execute(rows, actor);
+  }
+
+  @Post("resolve-billing-ticket")
+  @HttpCode(200)
+  async resolveBillingTicket(@Body() body: TicketFlowRequest) {
+    const ticketId = Number(body?.ticket_id);
+    if (!Number.isInteger(ticketId) || ticketId <= 0) {
+      return { error: 'A valid numeric "ticket_id" is required.' };
+    }
+    const actor = (body?.actor ?? "ops-console").trim() || "ops-console";
+    return this.resolveBillingTicketFlow.execute(ticketId, actor);
+  }
+
+  @Post("triage-ticket")
+  @HttpCode(200)
+  async triageTicket(@Body() body: TicketFlowRequest) {
+    const ticketId = Number(body?.ticket_id);
+    if (!Number.isInteger(ticketId) || ticketId <= 0) {
+      return { error: 'A valid numeric "ticket_id" is required.' };
+    }
+    const actor = (body?.actor ?? "ops-console").trim() || "ops-console";
+    return this.triageTicketFlow.execute(ticketId, actor);
   }
 }
