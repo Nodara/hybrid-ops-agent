@@ -5,3 +5,4 @@ dist
 data/*.db
 data/*.db-*
 .DS_Store
+PRODUCT_SPECS.md
